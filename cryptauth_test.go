@@ -262,13 +262,11 @@ func TestFluentAuthenticator(t *testing.T) {
 	}
 }
 
-func TestSaveUserToGopassFile(t *testing.T) {
-	tempDir := t.TempDir()
+func TestRegisterUser(t *testing.T) {
 	auth, err := NewAuthenticator("session-key-123")
 	if err != nil {
 		t.Fatalf("Failed to create authenticator: %v", err)
 	}
-	auth.WithUsersDir(tempDir)
 
 	username := "bob"
 	password := "bob-secure-pass"
@@ -276,11 +274,21 @@ func TestSaveUserToGopassFile(t *testing.T) {
 	role := "developer"
 	totpSecret := "KVKVE43VNVSTSMKM"
 
-	// Save user
-	err = auth.SaveUserToGopassFile(tempDir, username, password, passphrase, role, totpSecret, "")
-	if err != nil {
-		t.Fatalf("SaveUserToGopassFile failed: %v", err)
+	var mockAgeData []byte
+	// Setup dynamic retrieval hook
+	auth.GetEncryptedAgeData = func(u string) ([]byte, error) {
+		if u == username {
+			return mockAgeData, nil
+		}
+		return nil, os.ErrNotExist
 	}
+
+	// Register user
+	ageData, _, err := auth.RegisterUser(username, password, passphrase, role, totpSecret, "")
+	if err != nil {
+		t.Fatalf("RegisterUser failed: %v", err)
+	}
+	mockAgeData = ageData
 
 	// Verify Bob is now in memory
 	u, ok := auth.Users[username]
@@ -291,17 +299,19 @@ func TestSaveUserToGopassFile(t *testing.T) {
 		t.Errorf("Mismatch in registered memory user properties: %+v", u)
 	}
 
-	// Create a new fresh authenticator to simulate server restart and load Bob from disk
+	// Create a new fresh authenticator to simulate server restart and load Bob from DB/hooks
 	auth2, err := NewAuthenticator("session-key-123")
 	if err != nil {
 		t.Fatalf("Failed to create second authenticator: %v", err)
 	}
-	auth2.WithUsersDir(tempDir)
-
-	err = auth2.LoadUserRoleFromFile(tempDir, username)
-	if err != nil {
-		t.Fatalf("Failed to load user role from file: %v", err)
+	auth2.GetEncryptedAgeData = func(u string) ([]byte, error) {
+		if u == username {
+			return mockAgeData, nil
+		}
+		return nil, os.ErrNotExist
 	}
+
+	auth2.WithUser(username, &User{Username: username, Role: role})
 
 	// Verify authentication
 	totpToken, err := totp.Generate(totpSecret, time.Now().Unix())
@@ -319,12 +329,10 @@ func TestSaveUserToGopassFile(t *testing.T) {
 }
 
 func TestVerifyMnemonicRecovery(t *testing.T) {
-	tempDir := t.TempDir()
 	auth, err := NewAuthenticator("session-key-123")
 	if err != nil {
 		t.Fatalf("Failed to create authenticator: %v", err)
 	}
-	auth.WithUsersDir(tempDir)
 
 	username := "charlie"
 	password := "charlie-pass"
@@ -333,11 +341,20 @@ func TestVerifyMnemonicRecovery(t *testing.T) {
 	totpSecret := "KVKVE43VNVSTSMKM"
 	recoveryKey := "NATIVEBPM-REC-1234-5678-9012"
 
-	// Save user with recovery key
-	err = auth.SaveUserToGopassFile(tempDir, username, password, passphrase, role, totpSecret, recoveryKey)
-	if err != nil {
-		t.Fatalf("SaveUserToGopassFile with recovery key failed: %v", err)
+	var mockRecoveryData []byte
+	auth.GetEncryptedRecoveryData = func(u string) ([]byte, error) {
+		if u == username {
+			return mockRecoveryData, nil
+		}
+		return nil, os.ErrNotExist
 	}
+
+	// Save user with recovery key
+	_, recoveryData, err := auth.RegisterUser(username, password, passphrase, role, totpSecret, recoveryKey)
+	if err != nil {
+		t.Fatalf("RegisterUser with recovery key failed: %v", err)
+	}
+	mockRecoveryData = recoveryData
 
 	// 1. Verify verification works on loaded in-memory user
 	err = auth.VerifyMnemonicRecovery(username, "charlie-new-pass", recoveryKey)
@@ -363,17 +380,19 @@ func TestVerifyMnemonicRecovery(t *testing.T) {
 		t.Error("VerifyMnemonicRecovery succeeded with invalid password length")
 	}
 
-	// 2. Load from disk and verify it also reloads recovery key correctly
+	// 2. Load from hook and verify it also reloads recovery key correctly
 	auth2, err := NewAuthenticator("session-key-123")
 	if err != nil {
 		t.Fatalf("Failed to create second authenticator: %v", err)
 	}
-	auth2.WithUsersDir(tempDir)
-
-	err = auth2.LoadUserRoleFromFile(tempDir, username)
-	if err != nil {
-		t.Fatalf("Failed to load user role from file: %v", err)
+	auth2.GetEncryptedRecoveryData = func(u string) ([]byte, error) {
+		if u == username {
+			return mockRecoveryData, nil
+		}
+		return nil, os.ErrNotExist
 	}
+
+	auth2.WithUser(username, &User{Username: username, Role: role})
 
 	err = auth2.VerifyMnemonicRecovery(username, "charlie-new-pass", recoveryKey)
 	if err != nil {
@@ -382,12 +401,10 @@ func TestVerifyMnemonicRecovery(t *testing.T) {
 }
 
 func TestUpdateUserRoleAndGetUsers(t *testing.T) {
-	tempDir := t.TempDir()
 	auth, err := NewAuthenticator("session-key-123")
 	if err != nil {
 		t.Fatalf("Failed to create authenticator: %v", err)
 	}
-	auth.WithUsersDir(tempDir)
 
 	username := "daniel"
 	password := "daniel-pass"
@@ -395,9 +412,9 @@ func TestUpdateUserRoleAndGetUsers(t *testing.T) {
 	role := "viewer"
 	totpSecret := "KVKVE43VNVSTSMKM"
 
-	err = auth.SaveUserToGopassFile(tempDir, username, password, passphrase, role, totpSecret, "")
+	_, _, err = auth.RegisterUser(username, password, passphrase, role, totpSecret, "")
 	if err != nil {
-		t.Fatalf("SaveUserToGopassFile failed: %v", err)
+		t.Fatalf("RegisterUser failed: %v", err)
 	}
 
 	// 1. Verify GetUsers returns loaded users
@@ -410,7 +427,7 @@ func TestUpdateUserRoleAndGetUsers(t *testing.T) {
 	}
 
 	// 2. Update Role to developer
-	err = auth.UpdateUserRole(tempDir, username, passphrase, "developer")
+	err = auth.UpdateUserRole(username, "developer")
 	if err != nil {
 		t.Fatalf("UpdateUserRole failed: %v", err)
 	}
@@ -418,22 +435,6 @@ func TestUpdateUserRoleAndGetUsers(t *testing.T) {
 	// Verify in-memory role is updated
 	if auth.Users[username].Role != "developer" {
 		t.Errorf("In-memory role not updated, got %s", auth.Users[username].Role)
-	}
-
-	// 3. Reload from disk to verify persistence
-	auth2, err := NewAuthenticator("session-key-123")
-	if err != nil {
-		t.Fatalf("Failed to create second authenticator: %v", err)
-	}
-	auth2.WithUsersDir(tempDir)
-
-	err = auth2.LoadUserRoleFromFile(tempDir, username)
-	if err != nil {
-		t.Fatalf("Failed to load user role: %v", err)
-	}
-
-	if auth2.Users[username].Role != "developer" {
-		t.Errorf("Persisted role not updated, got %s", auth2.Users[username].Role)
 	}
 }
 

@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -73,9 +72,6 @@ type Authenticator struct {
 	Events        []*SecurityEvent
 	err           error // internal error tracking
 
-	// Safe password storage configurations
-	UsersDir      string
-
 	// Supabase integration fields
 	SupabaseJWTSecret []byte
 	SupabaseURL       string
@@ -125,15 +121,6 @@ func (a *Authenticator) WithSupabase(url, jwtSecret string) *Authenticator {
 	return a
 }
 
-// WithUsersDir configures the directory where user credentials and roles are stored.
-func (a *Authenticator) WithUsersDir(dir string) *Authenticator {
-	if a.err != nil {
-		return a
-	}
-	a.UsersDir = dir
-	return a
-}
-
 // ValidatePassword checks if the password meets the age-compatible length and safe character set criteria.
 func ValidatePassword(password string) error {
 	if len(password) < 8 {
@@ -161,37 +148,7 @@ func ValidatePassword(password string) error {
 	return nil
 }
 
-// LoadUserRoleFromFile loads only the user's role from the plain text .role file.
-func (a *Authenticator) LoadUserRoleFromFile(usersDir, username string) error {
-	roleFilePath := filepath.Join(usersDir, username+".role")
-	data, err := os.ReadFile(roleFilePath)
-	if err != nil {
-		return err
-	}
-	var roleMeta struct {
-		Role string `yaml:"role"`
-	}
-	if err := yaml.Unmarshal(data, &roleMeta); err != nil {
-		return err
-	}
 
-	role := roleMeta.Role
-	if role == "" {
-		role = "viewer"
-	}
-
-	a.muUsers.Lock()
-	if _, exists := a.Users[username]; !exists {
-		a.Users[username] = &User{
-			Username: username,
-			Role:     role,
-		}
-	} else {
-		a.Users[username].Role = role
-	}
-	a.muUsers.Unlock()
-	return nil
-}
 
 func encryptAgeSymmetric(data []byte, passphrase string) ([]byte, error) {
 	recipient, err := age.NewScryptRecipient(passphrase)
@@ -451,15 +408,10 @@ func (a *Authenticator) Authenticate(username, password, code string) (*User, er
 		}
 	}
 
-	// Read and decrypt [username].age dynamically using the provided password
-	var encryptedData []byte
-	var err error
-	if a.GetEncryptedAgeData != nil {
-		encryptedData, err = a.GetEncryptedAgeData(username)
-	} else {
-		filePath := filepath.Join(a.UsersDir, username+".age")
-		encryptedData, err = os.ReadFile(filePath)
+	if a.GetEncryptedAgeData == nil {
+		return nil, errors.New("database credentials provider is not configured")
 	}
+	encryptedData, err := a.GetEncryptedAgeData(username)
 	if err != nil {
 		return nil, errors.New("invalid username or password")
 	}
@@ -1023,43 +975,27 @@ func (a *Authenticator) GenerateGopassContent(username, password, passphrase, ro
 	return
 }
 
-// SaveUserToGopassFile hashes the password, serializes metadata, encrypts the gopass file using age scrypt symmetric encryption,
-// and saves it to the target directory under the username.age filename. It also registers the user in the Authenticator's in-memory map.
-func (a *Authenticator) SaveUserToGopassFile(usersDir, username, password, passphrase, role, totpSecret, recoveryKey string) error {
-	ageData, recoveryData, roleData, err := a.GenerateGopassContent(username, password, passphrase, role, totpSecret, recoveryKey)
+// RegisterUser registers a user in the in-memory map and returns the encrypted credentials data.
+func (a *Authenticator) RegisterUser(username, password, passphrase, role, totpSecret, recoveryKey string) (ageData []byte, recoveryData []byte, err error) {
+	ageData, recoveryData, _, err = a.GenerateGopassContent(username, password, passphrase, role, totpSecret, recoveryKey)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-
-	// Ensure directory exists and save file
-	if err := os.MkdirAll(usersDir, 0755); err != nil {
-		return fmt.Errorf("failed to create users directory: %w", err)
-	}
-
-	filePath := filepath.Join(usersDir, username+".age")
-	if err := os.WriteFile(filePath, ageData, 0600); err != nil {
-		return fmt.Errorf("failed to write encrypted user file: %w", err)
-	}
-
-	// Encrypt and save recovery file if recoveryKey is provided
-	if recoveryKey != "" {
-		recFilePath := filepath.Join(usersDir, username+".recovery")
-		if err := os.WriteFile(recFilePath, recoveryData, 0600); err != nil {
-			return fmt.Errorf("failed to write recovery file: %w", err)
-		}
-	}
-
-	// Save role in plain text YAML
-	roleFilePath := filepath.Join(usersDir, username+".role")
-	_ = os.WriteFile(roleFilePath, roleData, 0644)
 
 	// Hash password using bcrypt for registering in-memory User
-	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, errHash := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if errHash != nil {
+		return nil, nil, errHash
+	}
+
 	var recoveryHash string
 	if recoveryKey != "" {
 		cleanRecovery := strings.ToUpper(strings.ReplaceAll(recoveryKey, "-", ""))
 		cleanRecovery = strings.TrimSpace(cleanRecovery)
-		hashedRecovery, _ := bcrypt.GenerateFromPassword([]byte(cleanRecovery), bcrypt.DefaultCost)
+		hashedRecovery, errH := bcrypt.GenerateFromPassword([]byte(cleanRecovery), bcrypt.DefaultCost)
+		if errH != nil {
+			return nil, nil, errH
+		}
 		recoveryHash = string(hashedRecovery)
 	}
 
@@ -1077,14 +1013,11 @@ func (a *Authenticator) SaveUserToGopassFile(usersDir, username, password, passp
 	// Invalidate cached sessions for the user
 	a.InvalidateUserSessions(username)
 
-	return nil
+	return ageData, recoveryData, nil
 }
 
 // RecoverUserFromMnemonic decrypts the recovery file using the recovery key, and returns the loaded User metadata.
-func (a *Authenticator) RecoverUserFromMnemonic(usersDir, username, recoveryKey string) (*User, error) {
-	if usersDir == "" {
-		return nil, errors.New("users directory cannot be empty")
-	}
+func (a *Authenticator) RecoverUserFromMnemonic(username, recoveryKey string) (*User, error) {
 	if username == "" {
 		return nil, errors.New("username cannot be empty")
 	}
@@ -1096,14 +1029,10 @@ func (a *Authenticator) RecoverUserFromMnemonic(usersDir, username, recoveryKey 
 	cleanRecovery = strings.TrimSpace(cleanRecovery)
 
 	// Read [username].recovery
-	var encryptedData []byte
-	var err error
-	if a.GetEncryptedRecoveryData != nil {
-		encryptedData, err = a.GetEncryptedRecoveryData(username)
-	} else {
-		recFilePath := filepath.Join(usersDir, username+".recovery")
-		encryptedData, err = os.ReadFile(recFilePath)
+	if a.GetEncryptedRecoveryData == nil {
+		return nil, errors.New("database credentials provider is not configured")
 	}
+	encryptedData, err := a.GetEncryptedRecoveryData(username)
 	if err != nil {
 		return nil, errors.New("invalid recovery key or username")
 	}
@@ -1144,7 +1073,7 @@ func (a *Authenticator) RecoverUserFromMnemonic(usersDir, username, recoveryKey 
 		role = "viewer"
 	}
 
-	// If we loaded the user's role from disk, use it as source of truth
+	// If we have loaded the user's role, use it as source of truth
 	a.muUsers.RLock()
 	existingUser, exists := a.Users[username]
 	a.muUsers.RUnlock()
@@ -1169,7 +1098,7 @@ func (a *Authenticator) VerifyMnemonicRecovery(username, password, recoveryKey s
 	if err := ValidatePassword(password); err != nil {
 		return err
 	}
-	_, err := a.RecoverUserFromMnemonic(a.UsersDir, username, recoveryKey)
+	_, err := a.RecoverUserFromMnemonic(username, recoveryKey)
 	return err
 }
 // UserExists checks if a user is registered, thread-safely.
@@ -1199,11 +1128,8 @@ func (a *Authenticator) GetUsers() []*User {
 	return users
 }
 
-// UpdateUserRole updates a user's role in memory and rewrites their plain text .role file.
-func (a *Authenticator) UpdateUserRole(usersDir, username, passphrase, newRole string) error {
-	if usersDir == "" {
-		return errors.New("users directory cannot be empty")
-	}
+// UpdateUserRole updates a user's role in memory.
+func (a *Authenticator) UpdateUserRole(username, newRole string) error {
 	if username == "" {
 		return errors.New("username cannot be empty")
 	}
@@ -1221,23 +1147,6 @@ func (a *Authenticator) UpdateUserRole(usersDir, username, passphrase, newRole s
 	// Update role in memory
 	user.Role = newRole
 	a.muUsers.Unlock()
-
-	// Build YAML metadata payload using existing credentials
-	roleMeta := struct {
-		Role string `yaml:"role"`
-	}{
-		Role: newRole,
-	}
-	roleData, err := yaml.Marshal(roleMeta)
-	if err != nil {
-		return fmt.Errorf("failed to marshal role metadata: %w", err)
-	}
-
-	// Overwrite the plain text role file
-	filePath := filepath.Join(usersDir, username+".role")
-	if err := os.WriteFile(filePath, roleData, 0644); err != nil {
-		return fmt.Errorf("failed to write role file: %w", err)
-	}
 
 	// Invalidate cached sessions for the user
 	a.InvalidateUserSessions(username)
