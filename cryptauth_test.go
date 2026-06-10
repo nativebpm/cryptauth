@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"io"
 	"os"
-	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +14,12 @@ import (
 
 	"github.com/nativebpm/totp"
 )
+
+func TestMain(m *testing.M) {
+	// Disable TOTP bypass for security unit tests
+	totp.BypassEnabled = false
+	os.Exit(m.Run())
+}
 
 func TestAuthWithSymmetricGopassSecret(t *testing.T) {
 	// 1. Prepare secret content in gopass style
@@ -262,6 +268,7 @@ func TestSaveUserToGopassFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create authenticator: %v", err)
 	}
+	auth.WithUsersDir(tempDir)
 
 	username := "bob"
 	password := "bob-secure-pass"
@@ -289,17 +296,11 @@ func TestSaveUserToGopassFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create second authenticator: %v", err)
 	}
+	auth2.WithUsersDir(tempDir)
 
-	// Load users from tempDir
-	filePath := filepath.Join(tempDir, username+".age")
-	encryptedContent, err := os.ReadFile(filePath)
+	err = auth2.LoadUserRoleFromFile(tempDir, username)
 	if err != nil {
-		t.Fatalf("Failed to read encrypted file: %v", err)
-	}
-
-	err = auth2.LoadUserFromGopassContent(username, encryptedContent, passphrase, "")
-	if err != nil {
-		t.Fatalf("Failed to load user from encrypted file: %v", err)
+		t.Fatalf("Failed to load user role from file: %v", err)
 	}
 
 	// Verify authentication
@@ -323,6 +324,7 @@ func TestVerifyMnemonicRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create authenticator: %v", err)
 	}
+	auth.WithUsersDir(tempDir)
 
 	username := "charlie"
 	password := "charlie-pass"
@@ -338,27 +340,27 @@ func TestVerifyMnemonicRecovery(t *testing.T) {
 	}
 
 	// 1. Verify verification works on loaded in-memory user
-	err = auth.VerifyMnemonicRecovery(username, password, recoveryKey)
+	err = auth.VerifyMnemonicRecovery(username, "charlie-new-pass", recoveryKey)
 	if err != nil {
 		t.Errorf("VerifyMnemonicRecovery failed on in-memory user: %v", err)
 	}
 
 	// Verify verification works with clean normalized key containing hyphens and lowercase
-	err = auth.VerifyMnemonicRecovery(username, password, "nativebpm-rec-1234-5678-9012")
+	err = auth.VerifyMnemonicRecovery(username, "charlie-new-pass", "nativebpm-rec-1234-5678-9012")
 	if err != nil {
 		t.Errorf("VerifyMnemonicRecovery failed with normalized key: %v", err)
 	}
 
 	// Verify failure with wrong recovery key
-	err = auth.VerifyMnemonicRecovery(username, password, "NATIVEBPM-REC-9999-9999-9999")
+	err = auth.VerifyMnemonicRecovery(username, "charlie-new-pass", "NATIVEBPM-REC-9999-9999-9999")
 	if err == nil {
 		t.Error("VerifyMnemonicRecovery succeeded with incorrect recovery key")
 	}
 
-	// Verify failure with wrong password
-	err = auth.VerifyMnemonicRecovery(username, "wrong-pass", recoveryKey)
+	// Verify failure with invalid new password
+	err = auth.VerifyMnemonicRecovery(username, "short", recoveryKey)
 	if err == nil {
-		t.Error("VerifyMnemonicRecovery succeeded with incorrect password")
+		t.Error("VerifyMnemonicRecovery succeeded with invalid password length")
 	}
 
 	// 2. Load from disk and verify it also reloads recovery key correctly
@@ -366,19 +368,14 @@ func TestVerifyMnemonicRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create second authenticator: %v", err)
 	}
+	auth2.WithUsersDir(tempDir)
 
-	filePath := filepath.Join(tempDir, username+".age")
-	encryptedContent, err := os.ReadFile(filePath)
+	err = auth2.LoadUserRoleFromFile(tempDir, username)
 	if err != nil {
-		t.Fatalf("Failed to read encrypted file: %v", err)
+		t.Fatalf("Failed to load user role from file: %v", err)
 	}
 
-	err = auth2.LoadUserFromGopassContent(username, encryptedContent, passphrase, "")
-	if err != nil {
-		t.Fatalf("Failed to load user from encrypted file: %v", err)
-	}
-
-	err = auth2.VerifyMnemonicRecovery(username, password, recoveryKey)
+	err = auth2.VerifyMnemonicRecovery(username, "charlie-new-pass", recoveryKey)
 	if err != nil {
 		t.Errorf("VerifyMnemonicRecovery failed on reloaded user: %v", err)
 	}
@@ -390,6 +387,7 @@ func TestUpdateUserRoleAndGetUsers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create authenticator: %v", err)
 	}
+	auth.WithUsersDir(tempDir)
 
 	username := "daniel"
 	password := "daniel-pass"
@@ -427,20 +425,44 @@ func TestUpdateUserRoleAndGetUsers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create second authenticator: %v", err)
 	}
+	auth2.WithUsersDir(tempDir)
 
-	filePath := filepath.Join(tempDir, username+".age")
-	encryptedContent, err := os.ReadFile(filePath)
+	err = auth2.LoadUserRoleFromFile(tempDir, username)
 	if err != nil {
-		t.Fatalf("Failed to read encrypted file: %v", err)
-	}
-
-	err = auth2.LoadUserFromGopassContent(username, encryptedContent, passphrase, "")
-	if err != nil {
-		t.Fatalf("Failed to load user: %v", err)
+		t.Fatalf("Failed to load user role: %v", err)
 	}
 
 	if auth2.Users[username].Role != "developer" {
 		t.Errorf("Persisted role not updated, got %s", auth2.Users[username].Role)
+	}
+}
+
+func TestValidatePassword(t *testing.T) {
+	tests := []struct {
+		password string
+		valid    bool
+	}{
+		{"securepass123", true},
+		{"pass with spaces", true},
+		{"short", false},
+		{"spaceatstart ", false},
+		{" spaceatend", false},
+		{"contains$symbol", false},
+		{"contains`backtick", false},
+		{"contains\\backslash", false},
+		{"contains\"quotes", false},
+		{"contains'singlequotes", false},
+		{"contains|pipe", false},
+		{"contains&ampersand", false},
+		{"contains<less", false},
+		{"contains>greater", false},
+		{strings.Repeat("a", 73), false},
+	}
+	for _, tc := range tests {
+		err := ValidatePassword(tc.password)
+		if (err == nil) != tc.valid {
+			t.Errorf("ValidatePassword(%q) expected valid=%t, got err=%v", tc.password, tc.valid, err)
+		}
 	}
 }
 
