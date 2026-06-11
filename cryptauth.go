@@ -125,9 +125,6 @@ func (a *Authenticator) WithSupabase(url, jwtSecret string) *Authenticator {
 
 // ValidatePassword checks if the password meets the age-compatible length and safe character set criteria.
 func ValidatePassword(password string) error {
-	if password == "admin" {
-		return nil
-	}
 	if len(password) < 8 {
 		return errors.New("password must be at least 8 characters long")
 	}
