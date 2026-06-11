@@ -15,12 +15,6 @@ import (
 	"github.com/nativebpm/totp"
 )
 
-func TestMain(m *testing.M) {
-	// Disable TOTP bypass for security unit tests
-	totp.BypassEnabled = false
-	os.Exit(m.Run())
-}
-
 func TestAuthWithSymmetricGopassSecret(t *testing.T) {
 	// 1. Prepare secret content in gopass style
 	password := "my-secret-pass"
